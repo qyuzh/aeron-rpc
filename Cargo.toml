@@ -1,0 +1,21 @@
+[package]
+name = "aeron-rpc"
+version = "0.1.0"
+edition = "2024"
+authors = ["qyuzh <qyuzhang22@gmail.com>"]
+description = "Deadly simple RPC framework built on top of Aeron and Tokio"
+categories = ["asynchronous"]
+keywords = ["aeron", "rpc"]
+license = "MIT"
+documentation = "https://docs.rs/aeron-rpc"
+repository = "https://github.com/qyuzh/aeron-rpc"
+readme = "README.md"
+
+[dependencies]
+aeron-rs = "0.1.8"
+async-trait = "0.1.88"
+log = "0.4.27"
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+env_logger = "0.11.8"
