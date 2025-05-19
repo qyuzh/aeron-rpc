@@ -1,16 +1,14 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use aeron_rs::publication::Publication;
-use aeron_rs::subscription::Subscription;
-
+use crate::ToBusinessId;
 use crate::ToBytes;
-use crate::{ToBusinessId, publisher::Publisher, subscriber::Subscriber};
+use crate::protocol::{Request, Response, Status};
 
 pub struct RpcServerBuilder {
-    publisher: Option<Publisher>,
-    subscriber: Option<Subscriber>,
+    receiver: Option<tokio::sync::mpsc::Receiver<Request>>,
+    sender: Option<tokio::sync::mpsc::Sender<Response>>,
     handlers: HashMap<u64, Arc<dyn Handler + Send + Sync>>,
 }
 
@@ -23,19 +21,19 @@ impl Default for RpcServerBuilder {
 impl RpcServerBuilder {
     pub fn new() -> Self {
         Self {
-            publisher: None,
-            subscriber: None,
+            receiver: None,
+            sender: None,
             handlers: HashMap::new(),
         }
     }
 
-    pub fn add_publication(mut self, publication: Arc<Mutex<Publication>>) -> Self {
-        self.publisher = Some(Publisher::new(publication));
+    pub fn add_receiver(mut self, receiver: tokio::sync::mpsc::Receiver<Request>) -> Self {
+        self.receiver = Some(receiver);
         self
     }
 
-    pub fn add_subscription(mut self, publication: Arc<Mutex<Subscription>>) -> Self {
-        self.subscriber = Some(Subscriber::new(publication));
+    pub fn add_sender(mut self, sender: tokio::sync::mpsc::Sender<Response>) -> Self {
+        self.sender = Some(sender);
         self
     }
 
@@ -52,61 +50,54 @@ impl RpcServerBuilder {
     }
 
     pub fn build(self) -> Result<RpcServer, String> {
-        let publisher = self.publisher.ok_or("publisher is required")?;
-        let subscriber = self.subscriber.ok_or("subscriber is required")?;
+        let receiver = self.receiver.ok_or("receiver is required")?;
+        let sender = self.sender.ok_or("Sender is required")?;
         if self.handlers.is_empty() {
             return Err("at least one handler is required".to_string());
         }
-        Ok(RpcServer::new(
-            publisher,
-            subscriber,
-            Arc::new(self.handlers),
-        ))
+        Ok(RpcServer::new(Arc::new(self.handlers), receiver, sender))
     }
 }
 
 pub struct RpcServer {
     handlers: Arc<HashMap<u64, Arc<dyn Handler + Send + Sync>>>,
-    subscriber: Subscriber,
-    publisher: Publisher,
+    receiver: Option<tokio::sync::mpsc::Receiver<Request>>,
+    sender: Option<tokio::sync::mpsc::Sender<Response>>,
 }
 
 impl RpcServer {
     pub fn new(
-        publisher: Publisher,
-        subscriber: Subscriber,
         handlers: Arc<HashMap<u64, Arc<dyn Handler + Send + Sync>>>,
+        receiver: tokio::sync::mpsc::Receiver<Request>,
+        sender: tokio::sync::mpsc::Sender<Response>,
     ) -> Self {
         Self {
             handlers,
-            subscriber,
-            publisher,
+            receiver: Some(receiver),
+            sender: Some(sender),
         }
     }
 }
 
 impl RpcServer {
-    pub fn run(&mut self) -> Result<(), String> {
-        let (tx, rx) = tokio::sync::mpsc::channel(1 << 12);
-
-        self.subscriber.add_server_sender(tx);
-        self.subscriber.run();
-
+    pub async fn run(&mut self) -> Result<(), String> {
+        let receiver = self.receiver.take();
         let handlers = self.handlers.clone();
-        let publisher = self.publisher.clone();
+        let sender = self.sender.take().expect("sender is required");
 
         tokio::spawn(async move {
-            let mut rx = rx;
-            while let Some(payload) = rx.recv().await {
-                if let Some(handler) = handlers.get(&payload.business_id).cloned() {
-                    let publisher = publisher.clone();
+            let mut rx = receiver.expect("receiver is required");
+
+            while let Some(req) = rx.recv().await {
+                if let Some(handler) = handlers.get(&req.business_id).cloned() {
+                    let sender = sender.clone();
                     tokio::spawn(async move {
                         let (tx, rc) = tokio::sync::mpsc::channel(1 << 10);
                         let mut ctx = Context {
                             sender: Some(tx),
-                            request_id: payload.request_id,
+                            request_id: req.request_id,
                             session_id: 0,
-                            data: payload.data.clone(),
+                            data: req.data.clone(),
                         };
 
                         let t = handler.handle(&mut ctx).await;
@@ -118,19 +109,49 @@ impl RpcServer {
 
                             while let Some(data) = rx.recv().await {
                                 if let Some(last_data) = last_data {
-                                    publisher.response(payload.request_id, false, last_data);
+                                    sender
+                                        .send(Response::new(
+                                            req.request_id,
+                                            false,
+                                            Status::Ok,
+                                            last_data,
+                                        ))
+                                        .await
+                                        .unwrap();
                                 }
                                 last_data = Some(data);
                             }
 
                             if let Some(last_data) = last_data {
-                                publisher.response(payload.request_id, true, last_data);
+                                sender
+                                    .send(Response::new(
+                                        req.request_id,
+                                        true,
+                                        Status::Ok,
+                                        last_data,
+                                    ))
+                                    .await
+                                    .unwrap();
                             }
                         } else {
                             match t {
-                                Ok(data) => publisher.response(payload.request_id, true, data),
+                                Ok(data) => {
+                                    sender
+                                        .send(Response::new(req.request_id, true, Status::Ok, data))
+                                        .await
+                                        .unwrap();
+                                }
                                 Err(t) => {
-                                    publisher.response(payload.request_id, false, t.to_bytes())
+                                    log::error!("handler error: {}", t);
+                                    sender
+                                        .send(Response::new(
+                                            req.request_id,
+                                            true,
+                                            Status::Other,
+                                            t.to_bytes(),
+                                        ))
+                                        .await
+                                        .unwrap();
                                 }
                             }
                         }
@@ -139,7 +160,9 @@ impl RpcServer {
             }
 
             log::info!("server thread exit");
-        });
+        })
+        .await
+        .map_err(|e| e.to_string())?;
         Ok(())
     }
 }
@@ -165,8 +188,24 @@ pub struct Context {
     pub data: Vec<u8>,
 }
 
+pub enum FromContextError {
+    ParseError(String),
+    Other(String),
+}
+
+impl std::fmt::Display for FromContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FromContextError::ParseError(e) => write!(f, "Parse error: {}", e),
+            FromContextError::Other(e) => write!(f, "Other error: {}", e),
+        }
+    }
+}
+
 pub trait FromContext {
-    fn from_context(ctx: &mut Context) -> Self;
+    fn from_context(ctx: &mut Context) -> Result<Self, FromContextError>
+    where
+        Self: Sized;
 }
 
 #[async_trait::async_trait]
@@ -178,13 +217,13 @@ pub trait Handler: Send + Sync {
 impl<F, Fut, F1, Res> Handler for HandlerWrapper<F, F1, Res>
 where
     F: Fn(F1) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, String>> + Send + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
     F1: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
     async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx);
-        let res = (self.func)(req1).await?;
+        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
+        let res = (self.func)(req1).await;
         Ok(res.to_bytes())
     }
 }
@@ -193,15 +232,15 @@ where
 impl<F, Fut, F1, F2, Res> Handler for HandlerWrapper<F, (F1, F2), Res>
 where
     F: Fn(F1, F2) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, String>> + Send + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
     F1: FromContext + Send + Sync + 'static,
     F2: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
     async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx);
-        let req2 = F2::from_context(ctx);
-        let res = (self.func)(req1, req2).await?;
+        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
+        let req2 = F2::from_context(ctx).map_err(|e| e.to_string())?;
+        let res = (self.func)(req1, req2).await;
         Ok(res.to_bytes())
     }
 }
@@ -210,17 +249,17 @@ where
 impl<F, Fut, F1, F2, F3, Res> Handler for HandlerWrapper<F, (F1, F2, F3), Res>
 where
     F: Fn(F1, F2, F3) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, String>> + Send + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
     F1: FromContext + Send + Sync + 'static,
     F2: FromContext + Send + Sync + 'static,
     F3: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
     async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx);
-        let req2 = F2::from_context(ctx);
-        let req3 = F3::from_context(ctx);
-        let res = (self.func)(req1, req2, req3).await?;
+        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
+        let req2 = F2::from_context(ctx).map_err(|e| e.to_string())?;
+        let req3 = F3::from_context(ctx).map_err(|e| e.to_string())?;
+        let res = (self.func)(req1, req2, req3).await;
         Ok(res.to_bytes())
     }
 }
@@ -233,7 +272,7 @@ pub trait IntoHandlerWrapper<F1, Res>: Sized {
 impl<F, Fut, F1, F2, Res> IntoHandlerWrapper<(F1, F2), Res> for F
 where
     F: Fn(F1, F2) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, String>> + Send + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
     F1: FromContext + Send + Sync + 'static,
     F2: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
@@ -246,7 +285,7 @@ where
 impl<F, Fut, F1, Res> IntoHandlerWrapper<F1, Res> for F
 where
     F: Fn(F1) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = Result<Res, String>> + Send + 'static,
+    Fut: Future<Output = Res> + Send + 'static,
     F1: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
@@ -281,20 +320,23 @@ impl RespSender {
 }
 
 impl FromContext for RespSender {
-    fn from_context(ctx: &mut Context) -> Self {
-        let sender = ctx.sender.take().unwrap();
-        Self(sender)
+    fn from_context(ctx: &mut Context) -> Result<Self, FromContextError> {
+        let sender = ctx
+            .sender
+            .take()
+            .ok_or_else(|| FromContextError::Other("sender is not available".to_string()))?;
+        Ok(Self(sender))
     }
 }
 
 impl FromContext for String {
-    fn from_context(ctx: &mut Context) -> Self {
-        String::from_utf8(ctx.data.clone()).unwrap()
+    fn from_context(ctx: &mut Context) -> Result<Self, FromContextError> {
+        String::from_utf8(ctx.data.clone()).map_err(|e| FromContextError::ParseError(e.to_string()))
     }
 }
 
 impl FromContext for Vec<u8> {
-    fn from_context(ctx: &mut Context) -> Self {
-        ctx.data.clone()
+    fn from_context(ctx: &mut Context) -> Result<Self, FromContextError> {
+        Ok(ctx.data.clone())
     }
 }

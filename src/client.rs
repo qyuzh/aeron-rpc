@@ -1,30 +1,43 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, atomic::AtomicU32},
+    time::Duration,
+};
 
-use crate::{FromBytes, ToBusinessId, publisher::Publisher, subscriber::Subscriber};
+use tokio::sync::mpsc;
+
+use crate::{
+    FromBytes, ToBusinessId,
+    protocol::{Request, Response},
+};
 
 pub struct RpcClient {
-    publication: Publisher,   // Aeron publication for sending messages
-    subscription: Subscriber, // Aeron subscription for receiving messages
+    sender: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>,
+    pub request_id: Arc<AtomicU32>,
 }
 
 impl RpcClient {
-    pub fn new(publication: Publisher, subscription: Subscriber) -> Self {
-        let mut subscription = subscription;
-        subscription.run();
+    pub fn new(sender: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>) -> Self {
         Self {
-            publication,
-            subscription,
+            sender,
+            request_id: Arc::new(AtomicU32::new(1)),
         }
     }
-}
 
-impl RpcClient {
+    fn fetch_request_id(&self) -> u64 {
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
     pub fn send(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
     ) -> Result<(), String> {
-        let _ = self.publication.request(business_id, data);
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+        self.sender
+            .blocking_send((req, None))
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -37,9 +50,16 @@ impl RpcClient {
     where
         T: FromBytes,
     {
-        let request_id = self.publication.request(business_id, data)?;
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 10);
-        self.subscription.add_client_sender(request_id, tx);
+
+        self.sender
+            .send((req, Some(tx)))
+            .await
+            .map_err(|e| e.to_string())?;
+
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
                 Err("timeout".to_string())
@@ -48,32 +68,39 @@ impl RpcClient {
                 if result.is_none() {
                     Err("failed to receive response".to_string())
                 } else {
-                    let data = result.unwrap();
-                    T::from_bytes(data)
+                    let resp = result.unwrap();
+                    T::from_bytes(resp.data)
                 }
             }
         }
     }
 
-    pub fn send_and_receive_stream<T>(
+    pub async fn send_and_receive_stream<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
     ) -> Result<Stream<T>, String> {
-        let request_id = self.publication.request(business_id, data)?;
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+
         let (tx, rx) = tokio::sync::mpsc::channel(1 << 10);
-        self.subscription.add_client_sender(request_id, tx);
+
+        self.sender
+            .send((req, Some(tx)))
+            .await
+            .map_err(|e| e.to_string())?;
+
         Ok(Stream::new(rx))
     }
 }
 
 pub struct Stream<T> {
-    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::Receiver<Response>,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
-    pub fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Response>) -> Self {
         Self {
             rx,
             _marker: std::marker::PhantomData,
@@ -86,14 +113,14 @@ where
     T: FromBytes,
 {
     pub async fn next(&mut self) -> Option<Result<T, String>> {
-        self.rx.recv().await.map(T::from_bytes)
+        self.rx
+            .recv()
+            .await
+            .map(|r: Response| T::from_bytes(r.data))
     }
 }
 
-pub struct RpcClientBuilder {
-    publication: Option<Publisher>,
-    subscription: Option<Subscriber>,
-}
+pub struct RpcClientBuilder {}
 
 impl Default for RpcClientBuilder {
     fn default() -> Self {
@@ -103,31 +130,6 @@ impl Default for RpcClientBuilder {
 
 impl RpcClientBuilder {
     pub fn new() -> Self {
-        Self {
-            publication: None,
-            subscription: None,
-        }
-    }
-
-    pub fn add_publication(
-        mut self,
-        publication: std::sync::Arc<std::sync::Mutex<aeron_rs::publication::Publication>>,
-    ) -> Self {
-        self.publication = Some(Publisher::new(publication));
-        self
-    }
-
-    pub fn add_subscription(
-        mut self,
-        subscription: std::sync::Arc<std::sync::Mutex<aeron_rs::subscription::Subscription>>,
-    ) -> Self {
-        self.subscription = Some(Subscriber::new(subscription));
-        self
-    }
-
-    pub fn build(self) -> Result<RpcClient, String> {
-        let publication = self.publication.ok_or("publication is required")?;
-        let subscription = self.subscription.ok_or("subscription is required")?;
-        Ok(RpcClient::new(publication, subscription))
+        Self {}
     }
 }

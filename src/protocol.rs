@@ -11,6 +11,31 @@
 //! - b2
 //!   - 0: last data in stream
 //!   - 1: not last data in stream
+//! - b3-b6
+//!   - 0: response without internal error
+//!   - 1: response with internal error
+//!
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Status {
+    Ok = 0,
+    ParseError = 1,
+    Timeout = 2,
+    Other = 15,
+}
+
+impl From<u8> for Status {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Status::Ok,
+            1 => Status::ParseError,
+            2 => Status::Timeout,
+            15 => Status::Other,
+            _ => Status::Other,
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Request {
@@ -53,8 +78,8 @@ impl TryFrom<&[u8]> for Request {
             return Err("Not a request packet".to_string());
         }
 
-        let request_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-        let business_id = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+        let request_id = u64::from_le_bytes(buf[1..9].try_into().expect("Invalid request ID"));
+        let business_id = u64::from_le_bytes(buf[9..17].try_into().expect("Invalid business ID"));
         let data = buf[17..].to_vec();
 
         Ok(Self {
@@ -69,14 +94,16 @@ impl TryFrom<&[u8]> for Request {
 pub struct Response {
     pub response_id: u64,
     pub is_last: bool,
+    pub status: Status,
     pub data: Vec<u8>,
 }
 
 impl Response {
-    pub fn new(response_id: u64, is_last: bool, data: Vec<u8>) -> Self {
+    pub fn new(response_id: u64, is_last: bool, status: Status, data: Vec<u8>) -> Self {
         Self {
             response_id,
             is_last,
+            status,
             data,
         }
     }
@@ -85,7 +112,8 @@ impl Response {
 impl From<Response> for Vec<u8> {
     fn from(resp: Response) -> Self {
         let mut buf = Vec::with_capacity(1 + 8 + resp.data.len());
-        let flags: u8 = if resp.is_last { 4 } else { 0 };
+        let flags: u8 = if resp.is_last { 2 } else { 0 };
+        let flags = flags | ((resp.status as u8) << 2);
         buf.push(1 | flags); // flags = 1 for response
         buf.extend(&resp.response_id.to_le_bytes());
         buf.extend(&resp.data);
@@ -106,14 +134,16 @@ impl TryFrom<&[u8]> for Response {
             return Err("Not a response packet".to_string());
         }
 
-        let is_last = flags & 4 != 0;
+        let is_last = flags & 2 != 0;
+        let status = ((flags >> 2) & 15).into();
 
-        let response_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+        let response_id = u64::from_le_bytes(buf[1..9].try_into().expect("Invalid response ID"));
         let data = buf[9..].to_vec();
 
         Ok(Self {
             response_id,
             is_last,
+            status,
             data,
         })
     }
