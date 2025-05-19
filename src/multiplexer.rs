@@ -55,6 +55,7 @@ impl Multiplexer {
             let server_sender = self.server_sender.take().expect("server sender not found");
             let publication = self.publication.clone();
             let subscription = self.subscription.clone();
+
             let stop = self.stop.clone();
 
             move || {
@@ -97,14 +98,26 @@ impl Multiplexer {
                                 if let Some(sender) = response_sender {
                                     ht.insert(request.request_id, sender);
                                 }
+                                let request_id = request.request_id;
                                 let mut buffer: Vec<u8> = request.into();
                                 let atomic_buffer = AtomicBuffer::wrap_slice(&mut buffer);
                                 publication
                                     .lock()
                                     .unwrap()
                                     .offer(atomic_buffer)
-                                    .map_err(|e| format!("send failed: {:?}", e))
-                                    .expect("send failed");
+                                    .unwrap_or_else(|e| {
+                                        let msg = format!("send failed: {:?}", e);
+                                        log::error!("{}", msg);
+                                        let _ = ht.remove(&request_id).unwrap().blocking_send(
+                                            Response {
+                                                status: Status::Other,
+                                                response_id: request_id,
+                                                is_last: true,
+                                                data: msg.into_bytes(),
+                                            },
+                                        );
+                                        0
+                                    });
                             }
                             Err(e) => {
                                 if e == mpsc::error::TryRecvError::Empty {
@@ -118,7 +131,7 @@ impl Multiplexer {
                     subscription
                         .lock()
                         .unwrap()
-                        .poll(handler_ref, CHANNEL_SIZE as i32);
+                        .poll(handler_ref, (CHANNEL_SIZE >> 1) as i32);
 
                     log::trace!("Process messages from the handler...");
                     loop {
@@ -163,8 +176,10 @@ impl Multiplexer {
                                     .lock()
                                     .unwrap()
                                     .offer(atomic_buffer)
-                                    .map_err(|e| format!("send failed: {:?}", e))
-                                    .unwrap();
+                                    .unwrap_or_else(|e| {
+                                        log::error!("send failed: {:?}", e);
+                                        0
+                                    });
                             }
                             Err(e) => {
                                 if e == mpsc::error::TryRecvError::Empty {

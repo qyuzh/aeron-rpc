@@ -3,7 +3,7 @@ use tokio::runtime::Runtime;
 
 fn main() {
     env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
+        .filter_level(log::LevelFilter::Debug)
         .filter_module("aeron_rs", log::LevelFilter::Info)
         .format_file(true)
         .format_line_number(true)

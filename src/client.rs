@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     FromBytes, ToBusinessId,
-    protocol::{Request, Response},
+    protocol::{Request, Response, Status},
 };
 
 pub struct RpcClient {
@@ -69,6 +69,9 @@ impl RpcClient {
                     Err("failed to receive response".to_string())
                 } else {
                     let resp = result.unwrap();
+                    if resp.status != Status::Ok {
+                        return Err(format!("Error with {:?}, {}", resp.status, String::from_utf8_lossy(&resp.data)));
+                    }
                     T::from_bytes(resp.data)
                 }
             }
@@ -113,10 +116,18 @@ where
     T: FromBytes,
 {
     pub async fn next(&mut self) -> Option<Result<T, String>> {
-        self.rx
-            .recv()
-            .await
-            .map(|r: Response| T::from_bytes(r.data))
+        self.rx.recv().await.map(|r: Response| {
+            log::trace!("Received response: {:?}", r);
+            if r.status != Status::Ok {
+                Err(format!(
+                    "Error with {:?}, {}",
+                    r.status,
+                    String::from_utf8_lossy(&r.data)
+                ))
+            } else {
+                T::from_bytes(r.data)
+            }
+        })
     }
 }
 
