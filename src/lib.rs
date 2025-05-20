@@ -1,5 +1,7 @@
 pub mod aeron;
 pub mod client;
+mod data;
+pub mod err;
 pub mod multiplexer;
 mod protocol;
 pub mod server;
@@ -28,19 +30,19 @@ impl ToBusinessId for Interface {
 }
 
 pub trait FromBytes {
-    fn from_bytes(data: Vec<u8>) -> Result<Self, String>
+    fn from_bytes(data: Vec<u8>) -> Result<Self, FromBytesError>
     where
         Self: Sized;
 }
 
 impl FromBytes for String {
-    fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
-        String::from_utf8(data).map_err(|e| e.to_string())
+    fn from_bytes(data: Vec<u8>) -> Result<Self, FromBytesError> {
+        String::from_utf8(data).map_err(|e| FromBytesError::ParseError(e.to_string()))
     }
 }
 
 impl FromBytes for Vec<u8> {
-    fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
+    fn from_bytes(data: Vec<u8>) -> Result<Self, FromBytesError> {
         Ok(data)
     }
 }
@@ -106,16 +108,17 @@ use std::sync::{Arc, Mutex};
 use aeron_rs::publication::Publication;
 use aeron_rs::subscription::Subscription;
 use client::RpcClient;
+use err::FromBytesError;
 use multiplexer::Multiplexer;
-use protocol::{Request, Response};
+use protocol::{Client2MultiplexerSender, Multiplexer2ServerReceiver, Server2MultiplexerSender};
 use server::{Handler, HandlerWrapper, IntoHandlerWrapper, RpcServer};
 use tokio::sync::mpsc;
 
 pub struct RpcContext {
     multiplexer: Multiplexer,
-    rx: Option<mpsc::Receiver<Request>>,
-    tx2: Option<mpsc::Sender<Response>>,
-    tx3: Option<mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>>,
+    rx: Option<Multiplexer2ServerReceiver>,
+    tx2: Option<Server2MultiplexerSender>,
+    tx3: Option<Client2MultiplexerSender>,
     handlers: Option<HashMap<u64, Arc<dyn Handler + Send + Sync>>>,
     is_taken_client: bool,
     is_taken_server: bool,

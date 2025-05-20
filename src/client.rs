@@ -3,20 +3,21 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 
 use crate::{
     FromBytes, ToBusinessId,
-    protocol::{Request, Response, Status},
+    err::{ReceiveError, SendError},
+    protocol::{Client2MultiplexerSender, Request, Response, SendPacket},
 };
 
 pub struct RpcClient {
-    sender: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>,
+    sender: Client2MultiplexerSender,
     pub request_id: Arc<AtomicU32>,
 }
 
 impl RpcClient {
-    pub fn new(sender: mpsc::Sender<(Request, Option<mpsc::Sender<Response>>)>) -> Self {
+    pub fn new(sender: Client2MultiplexerSender) -> Self {
         Self {
             sender,
             request_id: Arc::new(AtomicU32::new(1)),
@@ -28,25 +29,34 @@ impl RpcClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64
     }
 
-    pub fn send(
+    pub async fn send(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
-    ) -> Result<(), String> {
+    ) -> Result<(), SendError> {
         let request_id = self.fetch_request_id();
         let req = Request::new(request_id, business_id.to_business_id(), data.into());
+        let (tx, rx) = oneshot::channel();
         self.sender
-            .blocking_send((req, None))
-            .map_err(|e| e.to_string())?;
+            .send(SendPacket {
+                request: req,
+                resp_sender: None,
+                send_signal: tx,
+            })
+            .await
+            .map_err(|e| SendError::Custom(e.to_string()))?;
+
+        rx.await.map_err(|e| SendError::Custom(e.to_string()))?;
+
         Ok(())
     }
 
-    pub async fn send_and_receive<T>(
+    pub async fn send_and_recv<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
         timeout: Duration,
-    ) -> Result<T, String>
+    ) -> Result<T, SendError>
     where
         T: FromBytes,
     {
@@ -55,30 +65,36 @@ impl RpcClient {
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 10);
 
+        let (signal_tx, signal_rx) = oneshot::channel();
         self.sender
-            .send((req, Some(tx)))
+            .send(SendPacket {
+                request: req,
+                resp_sender: Some(tx),
+                send_signal: signal_tx,
+            })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SendError::Custom(e.to_string()))?;
+
+        signal_rx
+            .await
+            .map_err(|e| SendError::Custom(e.to_string()))?;
 
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
-                Err("timeout".to_string())
+                Err(SendError::Timeout)
             }
             result = rx.recv() => {
                 if result.is_none() {
-                    Err("failed to receive response".to_string())
+                    Err(SendError::Custom("No response".to_string()))
                 } else {
                     let resp = result.unwrap();
-                    if resp.status != Status::Ok {
-                        return Err(format!("Error with {:?}, {}", resp.status, String::from_utf8_lossy(&resp.data)));
-                    }
-                    T::from_bytes(resp.data)
+                    Ok(T::from_bytes(resp.data)?)
                 }
             }
         }
     }
 
-    pub async fn send_and_receive_stream<T>(
+    pub async fn send_stream<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
@@ -88,10 +104,18 @@ impl RpcClient {
 
         let (tx, rx) = tokio::sync::mpsc::channel(1 << 10);
 
+        let (signal_tx, signal_rx) = oneshot::channel();
+
         self.sender
-            .send((req, Some(tx)))
+            .send(SendPacket {
+                request: req,
+                resp_sender: Some(tx),
+                send_signal: signal_tx,
+            })
             .await
             .map_err(|e| e.to_string())?;
+
+        signal_rx.await.map_err(|e| e.to_string())?;
 
         Ok(Stream::new(rx))
     }
@@ -115,18 +139,10 @@ impl<T> Stream<T>
 where
     T: FromBytes,
 {
-    pub async fn next(&mut self) -> Option<Result<T, String>> {
-        self.rx.recv().await.map(|r: Response| {
+    pub async fn next(&mut self) -> Option<Result<T, ReceiveError>> {
+        self.rx.recv().await.map(|r| {
             log::trace!("Received response: {:?}", r);
-            if r.status != Status::Ok {
-                Err(format!(
-                    "Error with {:?}, {}",
-                    r.status,
-                    String::from_utf8_lossy(&r.data)
-                ))
-            } else {
-                T::from_bytes(r.data)
-            }
+            Ok(T::from_bytes(r.data)?)
         })
     }
 }

@@ -39,7 +39,7 @@ fn main() {
 
         // Send request and receive response
         let response: Vec<u8> = client
-            .send_and_receive(
+            .send_and_recv(
                 &aeron_rpc::Interface::Ping,
                 b"hello server, Ping",
                 Duration::from_secs(10),
@@ -50,7 +50,7 @@ fn main() {
         log::info!("Received: {}", String::from_utf8_lossy(&response));
 
         let response: Vec<u8> = client
-            .send_and_receive(
+            .send_and_recv(
                 &aeron_rpc::Interface::Echo,
                 b"hello server, Echo",
                 Duration::from_secs(10),
@@ -61,10 +61,7 @@ fn main() {
         log::info!("Received: {}", String::from_utf8_lossy(&response));
 
         let mut resp = client
-            .send_and_receive_stream::<String>(
-                &aeron_rpc::Interface::Stream,
-                b"hello server, Stream",
-            )
+            .send_stream::<String>(&aeron_rpc::Interface::Stream, b"hello server, Stream")
             .await
             .expect("Failed to send/receive");
 
@@ -72,7 +69,7 @@ fn main() {
             match data {
                 Ok(data) => log::info!("Received: {}", data),
                 Err(e) => {
-                    log::info!("Error: {}", e);
+                    log::info!("Error: {:?}", e);
                     break;
                 }
             }

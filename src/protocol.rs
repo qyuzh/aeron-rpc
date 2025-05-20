@@ -11,31 +11,10 @@
 //! - b2
 //!   - 0: last data in stream
 //!   - 1: not last data in stream
-//! - b3-b6
-//!   - 0: response without internal error
-//!   - 1: response with internal error
 //!
 
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Status {
-    Ok = 0,
-    ParseError = 1,
-    Timeout = 2,
-    Other = 15,
-}
-
-impl From<u8> for Status {
-    fn from(value: u8) -> Self {
-        match value {
-            0 => Status::Ok,
-            1 => Status::ParseError,
-            2 => Status::Timeout,
-            15 => Status::Other,
-            _ => Status::Other,
-        }
-    }
-}
+use crate::err::SendError;
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub struct Request {
@@ -94,16 +73,14 @@ impl TryFrom<&[u8]> for Request {
 pub struct Response {
     pub response_id: u64,
     pub is_last: bool,
-    pub status: Status,
     pub data: Vec<u8>,
 }
 
 impl Response {
-    pub fn new(response_id: u64, is_last: bool, status: Status, data: Vec<u8>) -> Self {
+    pub fn new(response_id: u64, is_last: bool, data: Vec<u8>) -> Self {
         Self {
             response_id,
             is_last,
-            status,
             data,
         }
     }
@@ -113,7 +90,6 @@ impl From<Response> for Vec<u8> {
     fn from(resp: Response) -> Self {
         let mut buf = Vec::with_capacity(1 + 8 + resp.data.len());
         let flags: u8 = if resp.is_last { 2 } else { 0 };
-        let flags = flags | ((resp.status as u8) << 2);
         buf.push(1 | flags); // flags = 1 for response
         buf.extend(&resp.response_id.to_le_bytes());
         buf.extend(&resp.data);
@@ -135,7 +111,6 @@ impl TryFrom<&[u8]> for Response {
         }
 
         let is_last = flags & 2 != 0;
-        let status = ((flags >> 2) & 15).into();
 
         let response_id = u64::from_le_bytes(buf[1..9].try_into().expect("Invalid response ID"));
         let data = buf[9..].to_vec();
@@ -143,8 +118,27 @@ impl TryFrom<&[u8]> for Response {
         Ok(Self {
             response_id,
             is_last,
-            status,
             data,
         })
     }
 }
+
+pub struct SendPacket {
+    pub request: Request,
+    pub resp_sender: Option<mpsc::Sender<Response>>,
+    pub send_signal: oneshot::Sender<Result<(), SendError>>,
+}
+
+pub type Client2MultiplexerSender = mpsc::Sender<SendPacket>;
+pub type Client2MultiplexerReceiver = mpsc::Receiver<SendPacket>;
+
+pub struct ResponsePacket {
+    pub response: Response,
+    pub resp_signal: oneshot::Sender<Result<(), SendError>>,
+}
+
+pub type Multiplexer2ServerSender = mpsc::Sender<Request>;
+pub type Multiplexer2ServerReceiver = mpsc::Receiver<Request>;
+
+pub type Server2MultiplexerSender = mpsc::Sender<ResponsePacket>;
+pub type Server2MultiplexerReceiver = mpsc::Receiver<ResponsePacket>;

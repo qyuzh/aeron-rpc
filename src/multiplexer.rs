@@ -9,7 +9,10 @@ use aeron_rs::{
 };
 use tokio::sync::mpsc;
 
-use crate::protocol::Status;
+use crate::protocol::{
+    Client2MultiplexerReceiver, Multiplexer2ServerSender, ResponsePacket, SendPacket,
+    Server2MultiplexerReceiver,
+};
 use crate::{
     RequestId,
     protocol::{Request, Response},
@@ -18,9 +21,9 @@ use crate::{
 pub struct Multiplexer {
     publication: Arc<Mutex<Publication>>,
     subscription: Arc<Mutex<Subscription>>,
-    server_sender: Option<mpsc::Sender<Request>>,
-    server_receiver: Option<mpsc::Receiver<Response>>,
-    client_receiver: Option<mpsc::Receiver<(Request, Option<mpsc::Sender<Response>>)>>,
+    send_req_to_server: Option<Multiplexer2ServerSender>,
+    recv_res_from_server: Option<Server2MultiplexerReceiver>,
+    recv_req_from_client: Option<Client2MultiplexerReceiver>,
     stop: Arc<AtomicBool>,
 }
 
@@ -28,31 +31,38 @@ impl Multiplexer {
     pub fn new(
         publication: Arc<Mutex<Publication>>,
         subscription: Arc<Mutex<Subscription>>,
-        server_sender: mpsc::Sender<Request>,
-        server_receiver: mpsc::Receiver<Response>,
-        client_receiver: mpsc::Receiver<(Request, Option<mpsc::Sender<Response>>)>,
+        send_req_to_server: Multiplexer2ServerSender,
+        recv_res_from_server: Server2MultiplexerReceiver,
+        recv_req_from_server: Client2MultiplexerReceiver,
     ) -> Self {
         Self {
             publication,
             subscription,
-            server_sender: Some(server_sender),
-            server_receiver: Some(server_receiver),
-            client_receiver: Some(client_receiver),
+            send_req_to_server: Some(send_req_to_server),
+            recv_res_from_server: Some(recv_res_from_server),
+            recv_req_from_client: Some(recv_req_from_server),
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    pub async fn run2(&mut self) -> Result<(), MultiplexerError> {
+        todo!()
+    }
+
     pub fn run(&mut self) {
         std::thread::spawn({
-            let mut resp_receiver = self
-                .server_receiver
+            let mut recv_res_from_server = self
+                .recv_res_from_server
                 .take()
                 .expect("server receiver not found");
-            let mut client_receiver = self
-                .client_receiver
+            let mut recv_req_from_client = self
+                .recv_req_from_client
                 .take()
                 .expect("client receiver not found");
-            let server_sender = self.server_sender.take().expect("server sender not found");
+            let send_req_to_server = self
+                .send_req_to_server
+                .take()
+                .expect("server sender not found");
             let publication = self.publication.clone();
             let subscription = self.subscription.clone();
 
@@ -93,9 +103,13 @@ impl Multiplexer {
 
                     log::trace!("Send request from client...");
                     loop {
-                        match client_receiver.try_recv() {
-                            Ok((request, response_sender)) => {
-                                if let Some(sender) = response_sender {
+                        match recv_req_from_client.try_recv() {
+                            Ok(SendPacket {
+                                request,
+                                resp_sender,
+                                send_signal,
+                            }) => {
+                                if let Some(sender) = resp_sender {
                                     ht.insert(request.request_id, sender);
                                 }
                                 let request_id = request.request_id;
@@ -110,7 +124,6 @@ impl Multiplexer {
                                         log::error!("{}", msg);
                                         let _ = ht.remove(&request_id).unwrap().blocking_send(
                                             Response {
-                                                status: Status::Other,
                                                 response_id: request_id,
                                                 is_last: true,
                                                 data: msg.into_bytes(),
@@ -138,11 +151,6 @@ impl Multiplexer {
                         match rx.try_recv() {
                             Ok(msg) => {
                                 if let Ok(payload) = Response::try_from(msg.as_slice()) {
-                                    if payload.status != Status::Ok {
-                                        log::error!("Internal Error: {:?}", payload.status);
-                                        continue;
-                                    }
-
                                     if payload.is_last {
                                         if let Some(sender) = ht.remove(&payload.response_id) {
                                             sender.blocking_send(payload).unwrap();
@@ -151,7 +159,7 @@ impl Multiplexer {
                                         sender.blocking_send(payload).unwrap();
                                     }
                                 } else if let Ok(payload) = Request::try_from(msg.as_slice()) {
-                                    server_sender
+                                    send_req_to_server
                                         .blocking_send(payload)
                                         .expect("Server Handler Not Found");
                                 } else {
@@ -168,9 +176,12 @@ impl Multiplexer {
 
                     log::trace!("Send response from server...");
                     loop {
-                        match resp_receiver.try_recv() {
-                            Ok(resp) => {
-                                let mut buffer: Vec<u8> = resp.into();
+                        match recv_res_from_server.try_recv() {
+                            Ok(ResponsePacket {
+                                response,
+                                resp_signal,
+                            }) => {
+                                let mut buffer: Vec<u8> = response.into();
                                 let atomic_buffer = AtomicBuffer::wrap_slice(&mut buffer);
                                 publication
                                     .lock()
@@ -192,4 +203,8 @@ impl Multiplexer {
             }
         });
     }
+}
+
+pub enum MultiplexerError {
+    SendFailed(String),
 }

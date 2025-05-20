@@ -4,11 +4,14 @@ use std::sync::Arc;
 
 use crate::ToBusinessId;
 use crate::ToBytes;
-use crate::protocol::{Request, Response, Status};
+use crate::protocol::Multiplexer2ServerReceiver;
+use crate::protocol::Response;
+use crate::protocol::ResponsePacket;
+use crate::protocol::Server2MultiplexerSender;
 
 pub struct RpcServerBuilder {
-    receiver: Option<tokio::sync::mpsc::Receiver<Request>>,
-    sender: Option<tokio::sync::mpsc::Sender<Response>>,
+    recv_req: Option<Multiplexer2ServerReceiver>,
+    send_res: Option<Server2MultiplexerSender>,
     handlers: HashMap<u64, Arc<dyn Handler + Send + Sync>>,
 }
 
@@ -21,19 +24,19 @@ impl Default for RpcServerBuilder {
 impl RpcServerBuilder {
     pub fn new() -> Self {
         Self {
-            receiver: None,
-            sender: None,
+            recv_req: None,
+            send_res: None,
             handlers: HashMap::new(),
         }
     }
 
-    pub fn add_receiver(mut self, receiver: tokio::sync::mpsc::Receiver<Request>) -> Self {
-        self.receiver = Some(receiver);
+    pub fn add_receiver(mut self, receiver: Multiplexer2ServerReceiver) -> Self {
+        self.recv_req = Some(receiver);
         self
     }
 
-    pub fn add_sender(mut self, sender: tokio::sync::mpsc::Sender<Response>) -> Self {
-        self.sender = Some(sender);
+    pub fn add_sender(mut self, sender: Server2MultiplexerSender) -> Self {
+        self.send_res = Some(sender);
         self
     }
 
@@ -50,8 +53,8 @@ impl RpcServerBuilder {
     }
 
     pub fn build(self) -> Result<RpcServer, String> {
-        let receiver = self.receiver.ok_or("receiver is required")?;
-        let sender = self.sender.ok_or("Sender is required")?;
+        let receiver = self.recv_req.ok_or("receiver is required")?;
+        let sender = self.send_res.ok_or("Sender is required")?;
         if self.handlers.is_empty() {
             return Err("at least one handler is required".to_string());
         }
@@ -61,15 +64,15 @@ impl RpcServerBuilder {
 
 pub struct RpcServer {
     handlers: Arc<HashMap<u64, Arc<dyn Handler + Send + Sync>>>,
-    receiver: Option<tokio::sync::mpsc::Receiver<Request>>,
-    sender: Option<tokio::sync::mpsc::Sender<Response>>,
+    receiver: Option<Multiplexer2ServerReceiver>,
+    sender: Option<Server2MultiplexerSender>,
 }
 
 impl RpcServer {
     pub fn new(
         handlers: Arc<HashMap<u64, Arc<dyn Handler + Send + Sync>>>,
-        receiver: tokio::sync::mpsc::Receiver<Request>,
-        sender: tokio::sync::mpsc::Sender<Response>,
+        receiver: Multiplexer2ServerReceiver,
+        sender: Server2MultiplexerSender,
     ) -> Self {
         Self {
             handlers,
@@ -109,47 +112,57 @@ impl RpcServer {
 
                             while let Some(data) = rx.recv().await {
                                 if let Some(last_data) = last_data {
+                                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                                     sender
-                                        .send(Response::new(
-                                            req.request_id,
-                                            false,
-                                            Status::Ok,
-                                            last_data,
-                                        ))
+                                        .send(ResponsePacket {
+                                            response: Response::new(
+                                                req.request_id,
+                                                false,
+                                                last_data,
+                                            ),
+                                            resp_signal: signal_tx,
+                                        })
                                         .await
                                         .unwrap();
+                                    signal_rx.await.unwrap();
                                 }
                                 last_data = Some(data);
                             }
 
                             if let Some(last_data) = last_data {
+                                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                                 sender
-                                    .send(Response::new(
-                                        req.request_id,
-                                        true,
-                                        Status::Ok,
-                                        last_data,
-                                    ))
+                                    .send(ResponsePacket {
+                                        response: Response::new(req.request_id, true, last_data),
+                                        resp_signal: signal_tx,
+                                    })
                                     .await
                                     .unwrap();
+                                signal_rx.await.unwrap();
                             }
                         } else {
+                            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                             match t {
                                 Ok(data) => {
                                     sender
-                                        .send(Response::new(req.request_id, true, Status::Ok, data))
+                                        .send(ResponsePacket {
+                                            response: Response::new(req.request_id, true, data),
+                                            resp_signal: signal_tx,
+                                        })
                                         .await
                                         .unwrap();
                                 }
                                 Err(t) => {
                                     log::error!("handler error: {}", t);
                                     sender
-                                        .send(Response::new(
-                                            req.request_id,
-                                            true,
-                                            Status::Other,
-                                            t.to_bytes(),
-                                        ))
+                                        .send(ResponsePacket {
+                                            response: Response::new(
+                                                req.request_id,
+                                                true,
+                                                t.to_bytes(),
+                                            ),
+                                            resp_signal: signal_tx,
+                                        })
                                         .await
                                         .unwrap();
                                 }
