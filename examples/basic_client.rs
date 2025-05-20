@@ -39,10 +39,10 @@ fn main() {
 
         // Send request and receive response
         let response: Vec<u8> = client
-            .send_and_recv(
+            .send(
                 &aeron_rpc::Interface::Ping,
                 b"hello server, Ping",
-                Duration::from_secs(10),
+                Duration::from_secs(20),
             )
             .await
             .expect("Failed to send/receive");
@@ -50,7 +50,7 @@ fn main() {
         log::info!("Received: {}", String::from_utf8_lossy(&response));
 
         let response: Vec<u8> = client
-            .send_and_recv(
+            .send(
                 &aeron_rpc::Interface::Echo,
                 b"hello server, Echo",
                 Duration::from_secs(10),

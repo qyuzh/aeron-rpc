@@ -29,7 +29,7 @@ impl RpcClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64
     }
 
-    pub async fn send(
+    pub async fn send_oneway(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
@@ -41,17 +41,18 @@ impl RpcClient {
             .send(SendPacket {
                 request: req,
                 resp_sender: None,
+                timeout: Duration::from_secs(60),
                 send_signal: tx,
             })
             .await
             .map_err(|e| SendError::Custom(e.to_string()))?;
 
-        rx.await.map_err(|e| SendError::Custom(e.to_string()))?;
+        rx.await.map_err(|e| SendError::Custom(e.to_string()))??;
 
         Ok(())
     }
 
-    pub async fn send_and_recv<T>(
+    pub async fn send<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
@@ -70,6 +71,7 @@ impl RpcClient {
             .send(SendPacket {
                 request: req,
                 resp_sender: Some(tx),
+                timeout,
                 send_signal: signal_tx,
             })
             .await
@@ -77,7 +79,7 @@ impl RpcClient {
 
         signal_rx
             .await
-            .map_err(|e| SendError::Custom(e.to_string()))?;
+            .map_err(|e| SendError::Custom(e.to_string()))??;
 
         tokio::select! {
             _ = tokio::time::sleep(timeout) => {
@@ -98,7 +100,7 @@ impl RpcClient {
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
-    ) -> Result<Stream<T>, String> {
+    ) -> Result<Stream<T>, SendError> {
         let request_id = self.fetch_request_id();
         let req = Request::new(request_id, business_id.to_business_id(), data.into());
 
@@ -109,13 +111,16 @@ impl RpcClient {
         self.sender
             .send(SendPacket {
                 request: req,
+                timeout: Duration::from_secs(60),
                 resp_sender: Some(tx),
                 send_signal: signal_tx,
             })
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| SendError::Custom(e.to_string()))?;
 
-        signal_rx.await.map_err(|e| e.to_string())?;
+        signal_rx
+            .await
+            .map_err(|e| SendError::Custom(e.to_string()))??;
 
         Ok(Stream::new(rx))
     }
@@ -144,19 +149,5 @@ where
             log::trace!("Received response: {:?}", r);
             Ok(T::from_bytes(r.data)?)
         })
-    }
-}
-
-pub struct RpcClientBuilder {}
-
-impl Default for RpcClientBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RpcClientBuilder {
-    pub fn new() -> Self {
-        Self {}
     }
 }

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex, atomic::AtomicBool};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use aeron_rs::publication::Publication;
 use aeron_rs::{
@@ -70,8 +73,9 @@ impl Multiplexer {
 
             move || {
                 const CHANNEL_SIZE: usize = 20;
-                let mut ht = HashMap::<RequestId, mpsc::Sender<Response>>::new();
-                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
+                let mut ht =
+                    HashMap::<RequestId, (mpsc::Sender<Response>, Instant, Duration)>::new();
+                let (tx, mut fetch_data) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
 
                 let mut handler =
                     |buffer: &AtomicBuffer, offset: i32, length: i32, header: &Header| {
@@ -107,30 +111,31 @@ impl Multiplexer {
                             Ok(SendPacket {
                                 request,
                                 resp_sender,
+                                timeout,
                                 send_signal,
                             }) => {
                                 if let Some(sender) = resp_sender {
-                                    ht.insert(request.request_id, sender);
+                                    ht.insert(
+                                        request.request_id,
+                                        (sender, Instant::now(), timeout),
+                                    );
                                 }
-                                let request_id = request.request_id;
                                 let mut buffer: Vec<u8> = request.into();
                                 let atomic_buffer = AtomicBuffer::wrap_slice(&mut buffer);
-                                publication
-                                    .lock()
-                                    .unwrap()
-                                    .offer(atomic_buffer)
-                                    .unwrap_or_else(|e| {
-                                        let msg = format!("send failed: {:?}", e);
-                                        log::error!("{}", msg);
-                                        let _ = ht.remove(&request_id).unwrap().blocking_send(
-                                            Response {
-                                                response_id: request_id,
-                                                is_last: true,
-                                                data: msg.into_bytes(),
-                                            },
-                                        );
-                                        0
-                                    });
+                                match send(publication.lock().unwrap(), atomic_buffer) {
+                                    Ok(_) => {
+                                        send_signal.send(Ok(())).unwrap_or_else(|_| {
+                                            log::warn!("send_signal sender closed");
+                                        });
+                                    }
+                                    Err(e) => {
+                                        send_signal
+                                            .send(Err(crate::err::SendError::SendFailed(e)))
+                                            .unwrap_or_else(|_| {
+                                                log::warn!("send_signal sender closed");
+                                            });
+                                    }
+                                }
                             }
                             Err(e) => {
                                 if e == mpsc::error::TryRecvError::Empty {
@@ -148,27 +153,34 @@ impl Multiplexer {
 
                     log::trace!("Process messages from the handler...");
                     loop {
-                        match rx.try_recv() {
+                        match fetch_data.try_recv() {
                             Ok(msg) => {
                                 if let Ok(payload) = Response::try_from(msg.as_slice()) {
                                     if payload.is_last {
-                                        if let Some(sender) = ht.remove(&payload.response_id) {
+                                        if let Some((sender, _instant, _)) =
+                                            ht.remove(&payload.response_id)
+                                        {
                                             sender.blocking_send(payload).unwrap();
                                         }
-                                    } else if let Some(sender) = ht.get(&payload.response_id) {
+                                    } else if let Some((sender, instant, _)) =
+                                        ht.get_mut(&payload.response_id)
+                                    {
                                         sender.blocking_send(payload).unwrap();
+                                        *instant = Instant::now();
                                     }
                                 } else if let Ok(payload) = Request::try_from(msg.as_slice()) {
                                     send_req_to_server
                                         .blocking_send(payload)
                                         .expect("Server Handler Not Found");
                                 } else {
-                                    // TODO
+                                    log::warn!("Unknown message type");
                                 }
                             }
                             Err(e) => {
                                 if e == mpsc::error::TryRecvError::Empty {
                                     break;
+                                } else {
+                                    log::warn!("recv_req_from_client sender closed");
                                 }
                             }
                         }
@@ -177,27 +189,31 @@ impl Multiplexer {
                     log::trace!("Send response from server...");
                     loop {
                         match recv_res_from_server.try_recv() {
-                            Ok(ResponsePacket {
-                                response,
-                                resp_signal,
-                            }) => {
+                            Ok(ResponsePacket { response }) => {
                                 let mut buffer: Vec<u8> = response.into();
                                 let atomic_buffer = AtomicBuffer::wrap_slice(&mut buffer);
-                                publication
-                                    .lock()
-                                    .unwrap()
-                                    .offer(atomic_buffer)
-                                    .unwrap_or_else(|e| {
-                                        log::error!("send failed: {:?}", e);
-                                        0
-                                    });
+                                let _ = send(publication.lock().unwrap(), atomic_buffer);
                             }
                             Err(e) => {
                                 if e == mpsc::error::TryRecvError::Empty {
                                     break;
+                                } else {
+                                    log::warn!("recv_res_from_server sender closed");
                                 }
                             }
                         }
+                    }
+
+                    log::trace!("Check timeout...");
+                    let mut keys = vec![];
+                    for (key, (_, instant, timeout)) in ht.iter() {
+                        if &instant.elapsed() > timeout {
+                            log::warn!("Request timeout: {:?}", key);
+                            keys.push(*key);
+                        }
+                    }
+                    for key in keys {
+                        ht.remove(&key);
                     }
                 }
             }
@@ -207,4 +223,20 @@ impl Multiplexer {
 
 pub enum MultiplexerError {
     SendFailed(String),
+}
+
+fn send(publication: MutexGuard<'_, Publication>, buffer: AtomicBuffer) -> Result<(), String> {
+    let mut err = None;
+    for i in 0..3 {
+        match publication.offer(buffer) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                log::error!("Attempt {}, send failed: {:?}", i, e);
+                err = Some(e);
+            }
+        }
+        thread::yield_now();
+    }
+    log::error!("send failed after 3 attempts");
+    Err(err.unwrap().to_string())
 }

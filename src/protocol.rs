@@ -13,6 +13,8 @@
 //!   - 1: not last data in stream
 //!
 
+use std::time::Duration;
+
 use crate::err::SendError;
 use tokio::sync::{mpsc, oneshot};
 
@@ -126,6 +128,7 @@ impl TryFrom<&[u8]> for Response {
 pub struct SendPacket {
     pub request: Request,
     pub resp_sender: Option<mpsc::Sender<Response>>,
+    pub timeout: Duration,
     pub send_signal: oneshot::Sender<Result<(), SendError>>,
 }
 
@@ -134,7 +137,7 @@ pub type Client2MultiplexerReceiver = mpsc::Receiver<SendPacket>;
 
 pub struct ResponsePacket {
     pub response: Response,
-    pub resp_signal: oneshot::Sender<Result<(), SendError>>,
+    // pub resp_signal: oneshot::Sender<Result<(), SendError>>,
 }
 
 pub type Multiplexer2ServerSender = mpsc::Sender<Request>;

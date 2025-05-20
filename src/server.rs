@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use crate::ToBusinessId;
 use crate::ToBytes;
+use crate::err::SendError;
 use crate::protocol::Multiplexer2ServerReceiver;
 use crate::protocol::Response;
 use crate::protocol::ResponsePacket;
@@ -112,7 +113,6 @@ impl RpcServer {
 
                             while let Some(data) = rx.recv().await {
                                 if let Some(last_data) = last_data {
-                                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                                     sender
                                         .send(ResponsePacket {
                                             response: Response::new(
@@ -120,51 +120,34 @@ impl RpcServer {
                                                 false,
                                                 last_data,
                                             ),
-                                            resp_signal: signal_tx,
                                         })
                                         .await
-                                        .unwrap();
-                                    signal_rx.await.unwrap();
+                                        .expect("Multiplexer closed unexpectedly");
                                 }
                                 last_data = Some(data);
                             }
 
                             if let Some(last_data) = last_data {
-                                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                                 sender
                                     .send(ResponsePacket {
                                         response: Response::new(req.request_id, true, last_data),
-                                        resp_signal: signal_tx,
                                     })
                                     .await
-                                    .unwrap();
-                                signal_rx.await.unwrap();
+                                    .expect("Multiplexer closed unexpectedly");
                             }
                         } else {
-                            let (signal_tx, signal_rx) = tokio::sync::oneshot::channel();
                             match t {
                                 Ok(data) => {
                                     sender
                                         .send(ResponsePacket {
                                             response: Response::new(req.request_id, true, data),
-                                            resp_signal: signal_tx,
                                         })
                                         .await
-                                        .unwrap();
+                                        .expect("Multiplexer closed unexpectedly");
                                 }
                                 Err(t) => {
                                     log::error!("handler error: {}", t);
-                                    sender
-                                        .send(ResponsePacket {
-                                            response: Response::new(
-                                                req.request_id,
-                                                true,
-                                                t.to_bytes(),
-                                            ),
-                                            resp_signal: signal_tx,
-                                        })
-                                        .await
-                                        .unwrap();
+                                    panic!("Handler Error: {}", t);
                                 }
                             }
                         }
@@ -203,14 +186,14 @@ pub struct Context {
 
 pub enum FromContextError {
     ParseError(String),
-    Other(String),
+    Custom(String),
 }
 
 impl std::fmt::Display for FromContextError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FromContextError::ParseError(e) => write!(f, "Parse error: {}", e),
-            FromContextError::Other(e) => write!(f, "Other error: {}", e),
+            FromContextError::Custom(e) => write!(f, "Custom error: {}", e),
         }
     }
 }
@@ -223,7 +206,7 @@ pub trait FromContext {
 
 #[async_trait::async_trait]
 pub trait Handler: Send + Sync {
-    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String>;
+    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, FromContextError>;
 }
 
 #[async_trait::async_trait]
@@ -234,8 +217,8 @@ where
     F1: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
-    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
+    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, FromContextError> {
+        let req1 = F1::from_context(ctx)?;
         let res = (self.func)(req1).await;
         Ok(res.to_bytes())
     }
@@ -250,9 +233,9 @@ where
     F2: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
-    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
-        let req2 = F2::from_context(ctx).map_err(|e| e.to_string())?;
+    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, FromContextError> {
+        let req1 = F1::from_context(ctx)?;
+        let req2 = F2::from_context(ctx)?;
         let res = (self.func)(req1, req2).await;
         Ok(res.to_bytes())
     }
@@ -268,10 +251,10 @@ where
     F3: FromContext + Send + Sync + 'static,
     Res: ToBytes + Send + Sync + 'static,
 {
-    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, String> {
-        let req1 = F1::from_context(ctx).map_err(|e| e.to_string())?;
-        let req2 = F2::from_context(ctx).map_err(|e| e.to_string())?;
-        let req3 = F3::from_context(ctx).map_err(|e| e.to_string())?;
+    async fn handle(&self, ctx: &mut Context) -> Result<Vec<u8>, FromContextError> {
+        let req1 = F1::from_context(ctx)?;
+        let req2 = F2::from_context(ctx)?;
+        let req3 = F3::from_context(ctx)?;
         let res = (self.func)(req1, req2, req3).await;
         Ok(res.to_bytes())
     }
@@ -312,23 +295,17 @@ where
 pub struct RespSender(tokio::sync::mpsc::Sender<Vec<u8>>);
 
 impl RespSender {
-    pub fn blocking_send(&self, data: impl ToBytes) -> Result<(), String> {
+    pub fn blocking_send(&self, data: impl ToBytes) -> Result<(), SendError> {
         self.0
             .blocking_send(data.to_bytes())
-            .map_err(|_| "failed to send".to_string())
+            .map_err(|_| SendError::SendFailed("failed to send".to_string()))
     }
 
-    pub async fn send(&self, data: impl ToBytes) -> Result<(), String> {
+    pub async fn send(&self, data: impl ToBytes) -> Result<(), SendError> {
         self.0
             .send(data.to_bytes())
             .await
-            .map_err(|_| "failed to send".to_string())
-    }
-
-    pub fn try_send(&self, data: impl ToBytes) -> Result<(), String> {
-        self.0
-            .try_send(data.to_bytes())
-            .map_err(|_| "failed to send".to_string())
+            .map_err(|_| SendError::SendFailed("failed to send".to_string()))
     }
 }
 
@@ -337,7 +314,7 @@ impl FromContext for RespSender {
         let sender = ctx
             .sender
             .take()
-            .ok_or_else(|| FromContextError::Other("sender is not available".to_string()))?;
+            .ok_or_else(|| FromContextError::Custom("sender is not available".to_string()))?;
         Ok(Self(sender))
     }
 }
