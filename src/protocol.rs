@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use crate::err::SendError;
+use crate::err::{ReceiveError, SendError};
 use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
@@ -127,7 +127,7 @@ impl TryFrom<&[u8]> for Response {
 
 pub struct SendPacket {
     pub request: Request,
-    pub resp_sender: Option<mpsc::Sender<Response>>,
+    pub resp_sender: Option<mpsc::Sender<Result<Response, ReceiveError>>>,
     pub timeout: Duration,
     pub send_signal: oneshot::Sender<Result<(), SendError>>,
 }

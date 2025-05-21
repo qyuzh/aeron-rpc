@@ -9,6 +9,7 @@ pub enum SendError {
 #[derive(Debug)]
 pub enum ReceiveError {
     ParseError(String),
+    Timeout,
     Custom(String),
 }
 

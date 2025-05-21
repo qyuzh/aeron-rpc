@@ -12,6 +12,7 @@ use aeron_rs::{
 };
 use tokio::sync::mpsc;
 
+use crate::err::ReceiveError;
 use crate::protocol::{
     Client2MultiplexerReceiver, Multiplexer2ServerSender, ResponsePacket, SendPacket,
     Server2MultiplexerReceiver,
@@ -73,8 +74,14 @@ impl Multiplexer {
 
             move || {
                 const CHANNEL_SIZE: usize = 20;
-                let mut ht =
-                    HashMap::<RequestId, (mpsc::Sender<Response>, Instant, Duration)>::new();
+                let mut ht = HashMap::<
+                    RequestId,
+                    (
+                        mpsc::Sender<Result<Response, ReceiveError>>,
+                        Instant,
+                        Duration,
+                    ),
+                >::new();
                 let (tx, mut fetch_data) = mpsc::channel::<Vec<u8>>(CHANNEL_SIZE);
 
                 let mut handler =
@@ -160,12 +167,12 @@ impl Multiplexer {
                                         if let Some((sender, _instant, _)) =
                                             ht.remove(&payload.response_id)
                                         {
-                                            sender.blocking_send(payload).unwrap();
+                                            sender.blocking_send(Ok(payload)).unwrap();
                                         }
                                     } else if let Some((sender, instant, _)) =
                                         ht.get_mut(&payload.response_id)
                                     {
-                                        sender.blocking_send(payload).unwrap();
+                                        sender.blocking_send(Ok(payload)).unwrap();
                                         *instant = Instant::now();
                                     }
                                 } else if let Ok(payload) = Request::try_from(msg.as_slice()) {
@@ -208,12 +215,17 @@ impl Multiplexer {
                     let mut keys = vec![];
                     for (key, (_, instant, timeout)) in ht.iter() {
                         if &instant.elapsed() > timeout {
-                            log::warn!("Request timeout: {:?}", key);
                             keys.push(*key);
                         }
                     }
                     for key in keys {
-                        ht.remove(&key);
+                        if let Some(t) = ht.remove(&key) {
+                            log::warn!("Request timeout: {:?}", key);
+                            t.0.blocking_send(Err(ReceiveError::Timeout))
+                                .unwrap_or_else(|_| {
+                                    log::warn!("send_response sender closed");
+                                });
+                        }
                     }
                 }
             }
@@ -237,6 +249,6 @@ fn send(publication: MutexGuard<'_, Publication>, buffer: AtomicBuffer) -> Resul
         }
         thread::yield_now();
     }
-    log::error!("send failed after 3 attempts");
+    log::error!("Send failed after 3 attempts");
     Err(err.unwrap().to_string())
 }
