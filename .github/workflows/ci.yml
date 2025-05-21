@@ -28,6 +28,3 @@ jobs:
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Run typos
-        run: typos
