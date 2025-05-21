@@ -11,6 +11,12 @@
 //! - b2
 //!   - 0: last data in stream
 //!   - 1: not last data in stream
+//!
+
+use std::time::Duration;
+
+use crate::err::{ReceiveError, SendError};
+use tokio::sync::{mpsc, oneshot};
 
 #[derive(Debug)]
 pub struct Request {
@@ -53,8 +59,8 @@ impl TryFrom<&[u8]> for Request {
             return Err("Not a request packet".to_string());
         }
 
-        let request_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
-        let business_id = u64::from_le_bytes(buf[9..17].try_into().unwrap());
+        let request_id = u64::from_le_bytes(buf[1..9].try_into().expect("Invalid request ID"));
+        let business_id = u64::from_le_bytes(buf[9..17].try_into().expect("Invalid business ID"));
         let data = buf[17..].to_vec();
 
         Ok(Self {
@@ -85,7 +91,7 @@ impl Response {
 impl From<Response> for Vec<u8> {
     fn from(resp: Response) -> Self {
         let mut buf = Vec::with_capacity(1 + 8 + resp.data.len());
-        let flags: u8 = if resp.is_last { 4 } else { 0 };
+        let flags: u8 = if resp.is_last { 2 } else { 0 };
         buf.push(1 | flags); // flags = 1 for response
         buf.extend(&resp.response_id.to_le_bytes());
         buf.extend(&resp.data);
@@ -106,9 +112,9 @@ impl TryFrom<&[u8]> for Response {
             return Err("Not a response packet".to_string());
         }
 
-        let is_last = flags & 4 != 0;
+        let is_last = flags & 2 != 0;
 
-        let response_id = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+        let response_id = u64::from_le_bytes(buf[1..9].try_into().expect("Invalid response ID"));
         let data = buf[9..].to_vec();
 
         Ok(Self {
@@ -118,3 +124,24 @@ impl TryFrom<&[u8]> for Response {
         })
     }
 }
+
+pub struct SendPacket {
+    pub request: Request,
+    pub resp_sender: Option<mpsc::Sender<Result<Response, ReceiveError>>>,
+    pub timeout: Duration,
+    pub send_signal: oneshot::Sender<Result<(), SendError>>,
+}
+
+pub type Client2MultiplexerSender = mpsc::Sender<SendPacket>;
+pub type Client2MultiplexerReceiver = mpsc::Receiver<SendPacket>;
+
+pub struct ResponsePacket {
+    pub response: Response,
+    // pub resp_signal: oneshot::Sender<Result<(), SendError>>,
+}
+
+pub type Multiplexer2ServerSender = mpsc::Sender<Request>;
+pub type Multiplexer2ServerReceiver = mpsc::Receiver<Request>;
+
+pub type Server2MultiplexerSender = mpsc::Sender<ResponsePacket>;
+pub type Server2MultiplexerReceiver = mpsc::Receiver<ResponsePacket>;

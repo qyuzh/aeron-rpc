@@ -1,79 +1,134 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, atomic::AtomicU32},
+    time::Duration,
+};
 
-use crate::{FromBytes, ToBusinessId, publisher::Publisher, subscriber::Subscriber};
+use tokio::sync::oneshot;
+
+use crate::{
+    FromBytes, ToBusinessId,
+    err::{ReceiveError, SendError},
+    protocol::{Client2MultiplexerSender, Request, Response, SendPacket},
+};
 
 pub struct RpcClient {
-    publication: Publisher,   // Aeron publication for sending messages
-    subscription: Subscriber, // Aeron subscription for receiving messages
+    sender: Client2MultiplexerSender,
+    pub request_id: Arc<AtomicU32>,
 }
 
 impl RpcClient {
-    pub fn new(publication: Publisher, subscription: Subscriber) -> Self {
-        let mut subscription = subscription;
-        subscription.run();
+    pub fn new(sender: Client2MultiplexerSender) -> Self {
         Self {
-            publication,
-            subscription,
+            sender,
+            request_id: Arc::new(AtomicU32::new(1)),
         }
     }
-}
 
-impl RpcClient {
-    pub fn send(
+    fn fetch_request_id(&self) -> u64 {
+        self.request_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u64
+    }
+
+    /// Send a request without waiting for a response.
+    pub async fn report(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
-    ) -> Result<(), String> {
-        let _ = self.publication.request(business_id, data);
+    ) -> Result<(), SendError> {
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+        let (tx, rx) = oneshot::channel();
+        self.sender
+            .send(SendPacket {
+                request: req,
+                resp_sender: None,
+                timeout: Duration::from_secs(60),
+                send_signal: tx,
+            })
+            .await
+            .expect("Channel closed unexpectedly");
+
+        rx.await.expect("Channel closed unexpectedly")?;
+
         Ok(())
     }
 
-    pub async fn send_and_receive<T>(
+    /// Send a request and wait for a response.
+    pub async fn send<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
         timeout: Duration,
-    ) -> Result<T, String>
+    ) -> Result<T, SendError>
     where
         T: FromBytes,
     {
-        let request_id = self.publication.request(business_id, data)?;
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(1 << 10);
-        self.subscription.add_client_sender(request_id, tx);
-        tokio::select! {
-            _ = tokio::time::sleep(timeout) => {
-                Err("timeout".to_string())
-            }
-            result = rx.recv() => {
-                if result.is_none() {
-                    Err("failed to receive response".to_string())
-                } else {
-                    let data = result.unwrap();
-                    T::from_bytes(data)
+
+        let (signal_tx, signal_rx) = oneshot::channel();
+        self.sender
+            .send(SendPacket {
+                request: req,
+                resp_sender: Some(tx),
+                timeout,
+                send_signal: signal_tx,
+            })
+            .await
+            .expect("Channel closed unexpectedly");
+
+        signal_rx.await.expect("Channel closed unexpectedly")?;
+
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(resp) => {
+                let resp = resp.expect("Channel closed unexpectedly");
+                match resp {
+                    Ok(r) => Ok(T::from_bytes(r.data)?),
+                    Err(_) => Err(SendError::Timeout),
                 }
             }
+            Err(_) => Err(SendError::Timeout),
         }
     }
 
-    pub fn send_and_receive_stream<T>(
+    /// Send a request and receive a stream of responses.
+    pub async fn send_stream<T>(
         &self,
         business_id: &impl ToBusinessId,
         data: impl Into<Vec<u8>>,
-    ) -> Result<Stream<T>, String> {
-        let request_id = self.publication.request(business_id, data)?;
+    ) -> Result<Stream<T>, SendError> {
+        let request_id = self.fetch_request_id();
+        let req = Request::new(request_id, business_id.to_business_id(), data.into());
+
         let (tx, rx) = tokio::sync::mpsc::channel(1 << 10);
-        self.subscription.add_client_sender(request_id, tx);
+
+        let (signal_tx, signal_rx) = oneshot::channel();
+
+        self.sender
+            .send(SendPacket {
+                request: req,
+                timeout: Duration::from_secs(60),
+                resp_sender: Some(tx),
+                send_signal: signal_tx,
+            })
+            .await
+            .expect("Channel closed unexpectedly");
+
+        signal_rx.await.expect("Channel closed unexpectedly")?;
+
         Ok(Stream::new(rx))
     }
 }
 
 pub struct Stream<T> {
-    rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::Receiver<Result<Response, ReceiveError>>,
     _marker: std::marker::PhantomData<T>,
 }
 
 impl<T> Stream<T> {
-    pub fn new(rx: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+    pub fn new(rx: tokio::sync::mpsc::Receiver<Result<Response, ReceiveError>>) -> Self {
         Self {
             rx,
             _marker: std::marker::PhantomData,
@@ -85,49 +140,10 @@ impl<T> Stream<T>
 where
     T: FromBytes,
 {
-    pub async fn next(&mut self) -> Option<Result<T, String>> {
-        self.rx.recv().await.map(T::from_bytes)
-    }
-}
-
-pub struct RpcClientBuilder {
-    publication: Option<Publisher>,
-    subscription: Option<Subscriber>,
-}
-
-impl Default for RpcClientBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RpcClientBuilder {
-    pub fn new() -> Self {
-        Self {
-            publication: None,
-            subscription: None,
-        }
-    }
-
-    pub fn add_publication(
-        mut self,
-        publication: std::sync::Arc<std::sync::Mutex<aeron_rs::publication::Publication>>,
-    ) -> Self {
-        self.publication = Some(Publisher::new(publication));
-        self
-    }
-
-    pub fn add_subscription(
-        mut self,
-        subscription: std::sync::Arc<std::sync::Mutex<aeron_rs::subscription::Subscription>>,
-    ) -> Self {
-        self.subscription = Some(Subscriber::new(subscription));
-        self
-    }
-
-    pub fn build(self) -> Result<RpcClient, String> {
-        let publication = self.publication.ok_or("publication is required")?;
-        let subscription = self.subscription.ok_or("subscription is required")?;
-        Ok(RpcClient::new(publication, subscription))
+    pub async fn next(&mut self) -> Option<Result<T, ReceiveError>> {
+        self.rx.recv().await.map(|r| {
+            log::trace!("Received response: {:?}", r);
+            Ok(T::from_bytes(r?.data)?)
+        })
     }
 }

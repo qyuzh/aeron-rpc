@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '*'         # triggers on push to any branch
+  pull_request:
+    branches:
+      - '*'         # triggers on PRs targeting any branch
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Spell Check
+        uses: crate-ci/typos@v1.32.0
+
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
