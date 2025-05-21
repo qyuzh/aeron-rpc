@@ -20,8 +20,8 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Install typos
-        uses: crate-ci/typos@v1.16.19
+      - name: Spell Check
+        uses: crate-ci/typos@v1.32.0
 
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
